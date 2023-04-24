@@ -27,7 +27,7 @@ mod tests;
 
 use std::{array, cell::RefCell, fmt::Debug, io::Write, mem::take, rc::Rc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use risc0_zkp::{
     core::{
         digest::{DIGEST_BYTES, DIGEST_WORDS},
@@ -72,8 +72,9 @@ pub struct Executor<'a> {
     fini_cycles: usize,
     body_cycles: usize,
     segment_cycle: usize,
-    segments: Vec<Segment>,
     insn_counter: u32,
+    segments_count: u32,
+    journal: Journal,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -141,8 +142,9 @@ impl<'a> Executor<'a> {
             fini_cycles,
             body_cycles: 0,
             segment_cycle: init_cycles,
-            segments: Vec::new(),
             insn_counter: 0,
+            segments_count: 0,
+            journal: Journal::default(),
         }
     }
 
@@ -153,62 +155,83 @@ impl<'a> Executor<'a> {
         Ok(Self::new(env, image, program.entry))
     }
 
+    /// Run executor for a single [Segment]
+    pub fn run_step(&mut self) -> Result<Segment> {
+        if self.segments_count == 0 {
+            self.monitor.clear_session();
+            self.env
+                .io
+                .borrow_mut()
+                .with_write_fd(fileno::JOURNAL, self.journal.clone());
+        }
+
+        let segment = loop {
+            if let Some(exit_code) = self.step()? {
+                let total_cycles = self.total_cycles();
+                log::debug!("exit_code: {exit_code:?}, total_cycles: {total_cycles}");
+                assert!(total_cycles <= (1 << self.env.segment_limit_po2));
+                let pre_image = self.pre_image.clone();
+                self.monitor.image.hash_pages(); // TODO: hash only the dirty pages
+                let post_image_id = self.monitor.image.get_root();
+                let syscalls = take(&mut self.monitor.syscalls);
+                let faults = take(&mut self.monitor.faults);
+                let segment = Segment::new(
+                    pre_image,
+                    post_image_id,
+                    self.pre_pc,
+                    faults,
+                    syscalls,
+                    exit_code,
+                    log2_ceil(total_cycles.next_power_of_two()),
+                    self.segments_count,
+                );
+                match exit_code {
+                    ExitCode::SystemSplit(_) => self.split(),
+                    ExitCode::SessionLimit => bail!("Session limit exceeded"),
+                    ExitCode::Paused => {
+                        log::debug!("Paused: {}", self.segment_cycle);
+                        self.split();
+                    }
+                    ExitCode::Halted(inner) => {
+                        log::debug!("Halted({inner}): {}", self.segment_cycle);
+                    }
+                };
+
+                break segment;
+            }
+        };
+        self.segments_count += 1;
+
+        Ok(segment)
+    }
+
     /// Run the executor until [ExitCode::Paused] or [ExitCode::Halted] is
     /// reached, producing a [Session] as a result.
     pub fn run(&mut self) -> Result<Session> {
-        self.monitor.clear_session();
+        let mut segments = vec![];
 
-        let journal = Journal::default();
-        self.env
-            .io
-            .borrow_mut()
-            .with_write_fd(fileno::JOURNAL, journal.clone());
-
-        let mut run_loop = || -> Result<ExitCode> {
-            loop {
-                if let Some(exit_code) = self.step()? {
-                    let total_cycles = self.total_cycles();
-                    log::debug!("exit_code: {exit_code:?}, total_cycles: {total_cycles}");
-                    assert!(total_cycles <= (1 << self.env.segment_limit_po2));
-                    let pre_image = self.pre_image.clone();
-                    self.monitor.image.hash_pages(); // TODO: hash only the dirty pages
-                    let post_image_id = self.monitor.image.get_root();
-                    let syscalls = take(&mut self.monitor.syscalls);
-                    let faults = take(&mut self.monitor.faults);
-                    self.segments.push(Segment::new(
-                        pre_image,
-                        post_image_id,
-                        self.pre_pc,
-                        faults,
-                        syscalls,
-                        exit_code,
-                        log2_ceil(total_cycles.next_power_of_two()),
-                        self.segments
-                            .len()
-                            .try_into()
-                            .context("Too many segment to fit in u32")?,
-                    ));
-                    match exit_code {
-                        ExitCode::SystemSplit(_) => self.split(),
-                        ExitCode::SessionLimit => bail!("Session limit exceeded"),
-                        ExitCode::Paused => {
-                            log::debug!("Paused: {}", self.segment_cycle);
-                            self.split();
-                            return Ok(exit_code);
-                        }
-                        ExitCode::Halted(inner) => {
-                            log::debug!("Halted({inner}): {}", self.segment_cycle);
-                            return Ok(exit_code);
-                        }
-                    };
-                };
+        let exit_code = loop {
+            let segment = self.run_step()?;
+            let exit_code = segment.exit_code;
+            segments.push(segment);
+            match exit_code {
+                ExitCode::Halted(_) | ExitCode::Paused => {
+                    break exit_code;
+                }
+                _ => continue,
             }
         };
 
-        let exit_code = run_loop()?;
-        let mut segments = Vec::new();
-        std::mem::swap(&mut segments, &mut self.segments);
-        Ok(Session::new(segments, journal.buf.take(), exit_code))
+        Ok(Session {
+            segments,
+            journal: self.journal.buf.take(),
+            exit_code,
+        })
+    }
+
+    /// Access the raw journal buffer
+    pub fn get_journal(&self) -> Vec<u8> {
+        self.journal.buf.take()
     }
 
     fn split(&mut self) {
@@ -340,7 +363,7 @@ impl<'a> Executor<'a> {
     }
 
     fn session_cycle(&self) -> usize {
-        self.segments.len() * self.env.get_segment_limit() + self.segment_cycle
+        self.segments_count as usize * self.env.get_segment_limit() + self.segment_cycle
     }
 
     fn ecall(&mut self) -> Result<OpCodeResult> {

@@ -83,7 +83,9 @@ pub struct Segment {
     pub(crate) pc: u32,
     pub(crate) faults: PageFaults,
     pub(crate) syscalls: Vec<SyscallRecord>,
-    pub(crate) exit_code: ExitCode,
+
+    /// Exit code of the [Segment]
+    pub exit_code: ExitCode,
 
     /// The number of cycles in powers of 2.
     pub po2: usize,
